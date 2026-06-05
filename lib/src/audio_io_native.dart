@@ -2,6 +2,7 @@ import 'dart:async';
 import 'dart:io';
 import 'dart:typed_data';
 
+import '../audio_io.dart' show AudioIoPlaybackStats;
 import 'audio_io_stub.dart';
 import 'ffi/audio_io_ffi.dart';
 
@@ -31,6 +32,13 @@ class AudioIoNative implements AudioIoImpl {
     // Native backends negotiate [sampleRate] with the device, so the
     // web-only mismatch flag does not apply here.
     bool allowSampleRateMismatch = false,
+    // The FFI (Android/Windows/Linux/miniaudio) backend uses a fixed native
+    // ring buffer; configurable playback sizing and overflow policy are not
+    // wired through the C layer yet (tracked as a follow-up). Accepted for
+    // API symmetry and ignored here so callers get consistent behaviour.
+    double? playbackBufferSeconds,
+    double? maxPlaybackBufferSeconds,
+    int overflowPolicy = 0,
   }) async {
     _ffi = AudioIoFFI.instance;
     await _ffi!.start(sampleRate: sampleRate, format: format);
@@ -66,6 +74,21 @@ class AudioIoNative implements AudioIoImpl {
   @override
   Future<double> getFrameDuration() async {
     return await _ffi?.getFrameDuration() ?? 0.01;
+  }
+
+  @override
+  Future<void> flushPlayback() async {
+    // The miniaudio C layer exposes no ring-buffer clear primitive yet, so
+    // barge-in flush is a no-op on Android/Windows/Linux. Tracked as a
+    // follow-up: add an `audio_io_flush_playback` binding. iOS, macOS and web
+    // flush immediately.
+  }
+
+  @override
+  Future<AudioIoPlaybackStats?> playbackStats() async {
+    // No playback-queue introspection in the C bindings yet; return null
+    // (unsupported) rather than reporting misleading numbers.
+    return null;
   }
 }
 

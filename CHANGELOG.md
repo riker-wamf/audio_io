@@ -112,3 +112,23 @@ Platform Support:
 - Web ✅ (Web Audio API)
 - Linux ✅ (FFI/miniaudio)
 - Windows ✅ (FFI/miniaudio)
+
+## Unreleased
+Configurable, flushable, overflow-aware playback queue (real-time AI use)
+- `AudioIoConfig.playbackBufferDuration` makes the playback buffer size
+  configurable instead of a hardcoded 10 s, trading latency vs. underrun
+  protection (iOS, macOS, web). `null` keeps the 10 s default.
+- `AudioIo.flushPlayback()` drops queued, not-yet-played output audio for
+  barge-in / interrupt (e.g. on a Gemini Live `interrupted` event) without
+  stopping capture/playback (iOS, macOS, web).
+- Burst overflow (e.g. a 40 s response delivered in ~5 s) is no longer
+  silently dropped. New `AudioIoOverflowPolicy` (`grow` (default),
+  `dropOldest`, `dropNewest`) defines the behaviour; under `grow` the buffer
+  expands up to `maxPlaybackBufferDuration` (default 60 s). Drops are counted
+  and surfaced via `AudioIo.playbackStats()` instead of being silent.
+- Gemini Live example wired for barge-in and a small low-latency playback
+  buffer that grows for long responses.
+- Android/Linux/Windows (FFI/miniaudio): the new knobs are accepted for API
+  symmetry but not yet wired through the C layer (flush is a no-op, stats
+  return null) — tracked as a follow-up.
+- Needs on-device verification on iOS/macOS (no host Swift toolchain in CI).

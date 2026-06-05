@@ -14,6 +14,8 @@ class _Methods {
   static const requestFrameDuration = 'requestFrameDuration';
   static const getFrameDuration = 'getFrameDuration';
   static const getFormat = 'getFormat';
+  static const flushPlayback = 'flushPlayback';
+  static const getPlaybackStats = 'getPlaybackStats';
 }
 
 class _Channels {
@@ -77,6 +79,78 @@ enum AudioIoQuality {
   Highest,
 }
 
+/// What the playback queue does when audio arrives faster than it drains —
+/// e.g. Gemini Live returning a 40 s response in ~5 s, which is far more than
+/// the buffer holds. The previous behaviour silently dropped the entire
+/// overflowing chunk; every policy here makes the loss explicit (counted and
+/// reportable via [AudioIo.playbackStats]) and lets the caller pick the
+/// trade-off that fits their use case.
+enum AudioIoOverflowPolicy {
+  /// Grow the playback buffer to absorb the burst, up to
+  /// [AudioIoConfig.maxPlaybackBufferDuration]. Nothing is dropped until that
+  /// hard ceiling is hit. Best for long, self-contained responses (a Gemini
+  /// monologue) where you want gapless playback of the whole answer.
+  /// This is the default.
+  grow(0),
+
+  /// Keep the buffer at its configured size and, when full, discard the
+  /// *oldest* queued audio to make room for the newest. Best for strict
+  /// real-time where stale audio is worthless and staying current matters
+  /// more than completeness.
+  dropOldest(1),
+
+  /// Keep the buffer at its configured size and drop *incoming* audio that
+  /// does not fit (the historical behaviour — but now counted and signalled
+  /// rather than silent).
+  dropNewest(2);
+
+  const AudioIoOverflowPolicy(this.value);
+
+  /// Native policy identifier sent over the method channel.
+  final int value;
+}
+
+/// A snapshot of the playback queue, used to observe latency and detect
+/// overflow drops. Returned by [AudioIo.playbackStats].
+class AudioIoPlaybackStats {
+  /// Frames currently queued and not yet played (the live playback latency,
+  /// in frames; divide by the sample rate for seconds).
+  final int bufferedFrames;
+
+  /// Current playback-buffer capacity in frames. With
+  /// [AudioIoOverflowPolicy.grow] this rises as the buffer grows.
+  final int capacityFrames;
+
+  /// Cumulative frames dropped since the last [AudioIo.startWith] because the
+  /// queue overflowed. Non-zero means audio was lost — the explicit signal
+  /// that replaces the old silent drop. `null` when the platform cannot
+  /// report it (e.g. the FFI backend has no drop counter yet).
+  final int? droppedFrames;
+
+  const AudioIoPlaybackStats({
+    required this.bufferedFrames,
+    required this.capacityFrames,
+    this.droppedFrames,
+  });
+
+  /// Buffered audio expressed as a duration, given [sampleRateHz].
+  Duration bufferedDuration(int sampleRateHz) => Duration(
+        microseconds:
+            sampleRateHz <= 0 ? 0 : bufferedFrames * 1000000 ~/ sampleRateHz,
+      );
+
+  factory AudioIoPlaybackStats.fromMap(Map<dynamic, dynamic> map) =>
+      AudioIoPlaybackStats(
+        bufferedFrames: (map['bufferedFrames'] as num?)?.toInt() ?? 0,
+        capacityFrames: (map['capacityFrames'] as num?)?.toInt() ?? 0,
+        droppedFrames: (map['droppedFrames'] as num?)?.toInt(),
+      );
+
+  @override
+  String toString() => 'AudioIoPlaybackStats(buffered: $bufferedFrames, '
+      'capacity: $capacityFrames, dropped: $droppedFrames)';
+}
+
 /// Configuration for [AudioIo.startWith].
 class AudioIoConfig {
   /// Target sample rate.
@@ -103,17 +177,61 @@ class AudioIoConfig {
   /// device and ignore this flag.
   final bool allowSampleRateMismatch;
 
+  /// Initial size of the playback (output) ring buffer, expressed as a
+  /// duration of audio. This is the latency-vs-underrun knob: a small value
+  /// (e.g. 200 ms) keeps real-time conversation responsive, while a large
+  /// value protects long responses from underruns on a jittery network.
+  ///
+  /// `null` uses the platform default of 10 seconds (the prior hardcoded
+  /// behaviour). With [AudioIoOverflowPolicy.grow] this is the *starting*
+  /// capacity, which may grow up to [maxPlaybackBufferDuration].
+  final Duration? playbackBufferDuration;
+
+  /// Hard ceiling the playback buffer may grow to under
+  /// [AudioIoOverflowPolicy.grow]. Once reached, further overflow is dropped
+  /// and counted (see [AudioIoPlaybackStats.droppedFrames]) rather than
+  /// growing memory without bound. Ignored by the other overflow policies,
+  /// which never grow.
+  ///
+  /// `null` derives a sensible ceiling: `max(playbackBufferDuration, 60s)`.
+  /// Must be greater than or equal to [playbackBufferDuration].
+  final Duration? maxPlaybackBufferDuration;
+
+  /// How the playback queue behaves when audio arrives faster than it drains.
+  /// Defaults to [AudioIoOverflowPolicy.grow]. See [AudioIoOverflowPolicy].
+  final AudioIoOverflowPolicy playbackOverflow;
+
   const AudioIoConfig({
     this.sampleRate = AudioIoSampleRate.rate48000,
     this.format = AudioIoFormat.float64,
     this.latency = AudioIoLatency.Balanced,
     this.frameDurationMs,
     this.allowSampleRateMismatch = false,
+    this.playbackBufferDuration,
+    this.maxPlaybackBufferDuration,
+    this.playbackOverflow = AudioIoOverflowPolicy.grow,
   }) : assert(
           frameDurationMs == null ||
               (frameDurationMs >= 20 && frameDurationMs <= 100),
           'frameDurationMs must be between 20 and 100 milliseconds',
         );
+  // Note: the playback-duration bounds (>= ~50 ms, and
+  // maxPlaybackBufferDuration >= playbackBufferDuration) are not asserted
+  // here because Duration comparisons are not const-evaluable and this is a
+  // const constructor. The backends are defensive instead: the native floor
+  // (minPlaybackSamples) protects tiny values and the growth ceiling is
+  // resolved as max(requested-max, initial).
+
+  /// Resolved initial playback-buffer length in seconds, or `null` to let the
+  /// native layer apply its 10 s default.
+  double? get playbackBufferSeconds => playbackBufferDuration == null
+      ? null
+      : playbackBufferDuration!.inMicroseconds / 1000000.0;
+
+  /// Resolved growth ceiling in seconds, or `null` for the native default.
+  double? get maxPlaybackBufferSeconds => maxPlaybackBufferDuration == null
+      ? null
+      : maxPlaybackBufferDuration!.inMicroseconds / 1000000.0;
 }
 
 class AudioIo {
@@ -221,6 +339,9 @@ class AudioIo {
         sampleRate: config.sampleRate.hz,
         format: config.format.value,
         allowSampleRateMismatch: config.allowSampleRateMismatch,
+        playbackBufferSeconds: config.playbackBufferSeconds,
+        maxPlaybackBufferSeconds: config.maxPlaybackBufferSeconds,
+        overflowPolicy: config.playbackOverflow.value,
       );
       return;
     }
@@ -278,6 +399,10 @@ class AudioIo {
     return _methods.invokeMethod(_Methods.start, {
       'sampleRate': config.sampleRate.hz,
       'format': config.format.value,
+      // null lets the native side keep its 10 s / derived defaults.
+      'playbackBufferSeconds': config.playbackBufferSeconds,
+      'maxPlaybackBufferSeconds': config.maxPlaybackBufferSeconds,
+      'overflowPolicy': config.playbackOverflow.value,
     });
   }
 
@@ -292,6 +417,38 @@ class AudioIo {
     await _inputSubscription?.cancel();
     await _outputBytesSubscription?.cancel();
     await _methods.invokeMethod(_Methods.stop);
+  }
+
+  /// Immediately drop all queued, not-yet-played output audio.
+  ///
+  /// This is the barge-in / interrupt primitive: when Gemini Live (or any
+  /// streaming source) reports an `interrupted` event, call this so the
+  /// already-queued — now stale — audio stops playing at once instead of
+  /// talking over the user. Capture/playback stay running; only the pending
+  /// output queue is cleared. Feeding new audio afterwards resumes playback
+  /// normally.
+  Future<void> flushPlayback() async {
+    if (_impl.usePlatformImpl) {
+      await _impl.flushPlayback();
+      return;
+    }
+    await _methods.invokeMethod(_Methods.flushPlayback);
+  }
+
+  /// Snapshot of the playback queue — buffered/queued frames, current
+  /// capacity, and the cumulative overflow-drop counter. Use it to monitor
+  /// playback latency and to detect when audio is being dropped (the explicit
+  /// signal that replaces the old silent tail-drop). Returns `null` if the
+  /// platform cannot report stats.
+  Future<AudioIoPlaybackStats?> playbackStats() async {
+    if (_impl.usePlatformImpl) {
+      return _impl.playbackStats();
+    }
+    final value = await _methods.invokeMethod(_Methods.getPlaybackStats);
+    if (value is Map) {
+      return AudioIoPlaybackStats.fromMap(value);
+    }
+    return null;
   }
 
   Future<Map<String, dynamic>?> getFormat() async {

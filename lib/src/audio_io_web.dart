@@ -6,6 +6,7 @@ import 'dart:js_interop_unsafe';
 import 'package:flutter/foundation.dart';
 import 'package:web/web.dart' as web;
 
+import '../audio_io.dart' show AudioIoOverflowPolicy, AudioIoPlaybackStats;
 import 'audio_io_stub.dart';
 
 @JS('window')
@@ -85,6 +86,9 @@ class AudioIoWeb implements AudioIoImpl {
   // delivered reliably by the main-thread ScriptProcessor, so they fall back to
   // the default buffer. The public `frameDurationMs` knob starts at 20ms.
   static const _minHonouredFrameDuration = 0.02;
+  // Playback queue defaults, in seconds, matching the native backends.
+  static const _defaultPlaybackSeconds = 10.0;
+  static const _defaultMaxPlaybackSeconds = 60.0;
 
   AudioContext? _audioContext;
   ScriptProcessorNode? _scriptProcessor;
@@ -102,6 +106,17 @@ class AudioIoWeb implements AudioIoImpl {
   // Actual ScriptProcessor buffer size chosen for the running pipeline, so
   // getFrameDuration() can report the duration the caller really gets.
   int _activeBufferSize = _defaultBufferSize;
+
+  // Playback queue sizing/policy, resolved at start() once the AudioContext
+  // sample rate is known. The web "queue" is a software FIFO (_outputBuffer)
+  // feeding the ScriptProcessor; these bound it instead of letting it grow
+  // without limit and surface drops via playbackStats().
+  double? _requestedPlaybackSeconds;
+  double? _requestedMaxPlaybackSeconds;
+  AudioIoOverflowPolicy _overflowPolicy = AudioIoOverflowPolicy.grow;
+  int _playbackTargetSamples = 1 << 30;
+  int _playbackMaxSamples = 1 << 30;
+  int _droppedFrames = 0;
 
   @override
   bool get usePlatformImpl => true;
@@ -123,6 +138,9 @@ class AudioIoWeb implements AudioIoImpl {
     int sampleRate = 48000,
     int format = 0,
     bool allowSampleRateMismatch = false,
+    double? playbackBufferSeconds,
+    double? maxPlaybackBufferSeconds,
+    int overflowPolicy = 0,
   }) async {
     if (_isRunning) {
       // A same-config restart is a no-op; a reconfigure (different rate or
@@ -139,6 +157,11 @@ class AudioIoWeb implements AudioIoImpl {
     }
     _format = format;
     _requestedSampleRate = sampleRate;
+    _requestedPlaybackSeconds = playbackBufferSeconds;
+    _requestedMaxPlaybackSeconds = maxPlaybackBufferSeconds;
+    _overflowPolicy =
+        AudioIoOverflowPolicy.values[overflowPolicy.clamp(0, 2)];
+    _droppedFrames = 0;
 
     try {
       _audioContext = AudioContext();
@@ -171,6 +194,7 @@ class AudioIoWeb implements AudioIoImpl {
       }
 
       _activeBufferSize = _resolveBufferSize(_audioContext!.sampleRate);
+      _resolvePlaybackBounds(_audioContext!.sampleRate);
       _scriptProcessor = _audioContext!.createScriptProcessor(
         _activeBufferSize,
         1,
@@ -184,11 +208,11 @@ class AudioIoWeb implements AudioIoImpl {
 
       if (_format == _pcm16FormatValue) {
         _outputBytesController!.stream.listen((bytes) {
-          _outputBuffer.addAll(_pcm16LeToFloat32(bytes));
+          _enqueueOutput(_pcm16LeToFloat32(bytes));
         });
       } else {
         _outputController!.stream.listen((data) {
-          _outputBuffer.addAll(data);
+          _enqueueOutput(data);
         });
       }
 
@@ -322,6 +346,71 @@ class AudioIoWeb implements AudioIoImpl {
   Future<double> getFrameDuration() async {
     final sampleRate = _audioContext?.sampleRate ?? 48000.0;
     return _activeBufferSize / sampleRate;
+  }
+
+  @override
+  Future<void> flushPlayback() async {
+    // Barge-in: drop everything still queued for playback. Capture/playback
+    // stay running; the next output frames simply start a fresh queue.
+    _outputBuffer.clear();
+  }
+
+  @override
+  Future<AudioIoPlaybackStats?> playbackStats() async {
+    return AudioIoPlaybackStats(
+      bufferedFrames: _outputBuffer.length,
+      capacityFrames: _overflowPolicy == AudioIoOverflowPolicy.grow
+          ? _playbackMaxSamples
+          : _playbackTargetSamples,
+      droppedFrames: _droppedFrames,
+    );
+  }
+
+  /// Resolves the playback FIFO bounds (in samples) from the requested
+  /// durations and the live AudioContext rate. Mirrors the native defaults:
+  /// 10 s initial, grown to max(initial, 60 s).
+  void _resolvePlaybackBounds(double sampleRate) {
+    final targetSeconds =
+        _requestedPlaybackSeconds ?? _defaultPlaybackSeconds;
+    final requestedMax = _requestedMaxPlaybackSeconds ??
+        (targetSeconds > _defaultMaxPlaybackSeconds
+            ? targetSeconds
+            : _defaultMaxPlaybackSeconds);
+    // Defensive: the growth ceiling can never be below the initial size.
+    final maxSeconds =
+        requestedMax > targetSeconds ? requestedMax : targetSeconds;
+    _playbackTargetSamples = (targetSeconds * sampleRate).round();
+    _playbackMaxSamples = (maxSeconds * sampleRate).round();
+  }
+
+  /// Appends decoded float samples to the playback FIFO, applying the
+  /// configured overflow policy and counting any dropped frames so
+  /// [playbackStats] can surface them instead of losing audio silently.
+  void _enqueueOutput(List<double> samples) {
+    switch (_overflowPolicy) {
+      case AudioIoOverflowPolicy.grow:
+      case AudioIoOverflowPolicy.dropNewest:
+        final cap = _overflowPolicy == AudioIoOverflowPolicy.grow
+            ? _playbackMaxSamples
+            : _playbackTargetSamples;
+        final room = cap - _outputBuffer.length;
+        if (samples.length <= room) {
+          _outputBuffer.addAll(samples);
+        } else {
+          if (room > 0) {
+            _outputBuffer.addAll(samples.take(room));
+          }
+          _droppedFrames += samples.length - (room > 0 ? room : 0);
+        }
+        break;
+      case AudioIoOverflowPolicy.dropOldest:
+        _outputBuffer.addAll(samples);
+        while (_outputBuffer.length > _playbackTargetSamples) {
+          _outputBuffer.removeFirst();
+          _droppedFrames++;
+        }
+        break;
+    }
   }
 
   /// Maps a requested frame duration to a ScriptProcessorNode buffer size.

@@ -121,6 +121,40 @@ enum AudioIoLatency {
 await audioIo.requestLatency(AudioIoLatency.Realtime);
 ```
 
+### Playback Buffer (real-time streaming / Gemini Live)
+
+The playback (output) queue is configurable for streaming AI use, where audio
+arrives from the network in bursts. Supported on iOS, macOS and web.
+
+```dart
+await AudioIo.instance.startWith(const AudioIoConfig(
+  sampleRate: AudioIoSampleRate.rate16000,
+  format: AudioIoFormat.pcm16,
+  // Latency vs. underrun protection. Small = responsive conversation;
+  // large = safer for long responses. null keeps the 10 s default.
+  playbackBufferDuration: Duration(seconds: 2),
+  // When audio arrives faster than it plays (e.g. a 40 s response delivered
+  // in ~5 s), grow the buffer to absorb it — up to this ceiling.
+  maxPlaybackBufferDuration: Duration(seconds: 60),
+  // grow (default) | dropOldest | dropNewest. Drops are counted, never silent.
+  playbackOverflow: AudioIoOverflowPolicy.grow,
+));
+
+// Barge-in: the user interrupted, so drop the stale queued audio at once
+// (capture/playback keep running). e.g. on a Gemini Live `interrupted` event.
+await AudioIo.instance.flushPlayback();
+
+// Observe playback latency and detect overflow drops.
+final stats = await AudioIo.instance.playbackStats();
+if (stats != null && (stats.droppedFrames ?? 0) > 0) {
+  // Audio was dropped — increase the buffer or check the network.
+}
+```
+
+> Android, Linux and Windows (FFI/miniaudio) accept these options for API
+> symmetry, but configurable sizing, `flushPlayback()` and `playbackStats()`
+> are not yet wired through the C layer (tracked as a follow-up).
+
 ## Audio Format
 
 All platforms use a consistent audio format:

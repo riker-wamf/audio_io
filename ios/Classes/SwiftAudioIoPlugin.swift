@@ -22,6 +22,23 @@ private enum _Constants {
     static let formatFloat64 = "float64"
     static let formatPcm16 = "pcm16"
     static let pcm16ScaleFactor: Float = 32767.0
+    // Playback ring-buffer defaults (seconds of audio). The initial size is the
+    // latency-vs-underrun knob; the buffer may grow up to the max under the
+    // `grow` overflow policy. Mirrors the Dart-side defaults.
+    static let defaultPlaybackSeconds = 10.0
+    static let defaultMaxPlaybackSeconds = 60.0
+    // Absolute floor so a tiny configured buffer still holds a few render
+    // quanta. Replaces the old fixed 131072-sample floor, which (at low rates)
+    // was several seconds and would have defeated small-latency configs.
+    static let minPlaybackSamples = 2048
+}
+
+// How the playback queue reacts when audio arrives faster than it drains.
+// Raw values match AudioIoOverflowPolicy on the Dart side.
+enum OverflowPolicy: Int {
+    case grow = 0
+    case dropOldest = 1
+    case dropNewest = 2
 }
 
 enum Methods: String {
@@ -31,6 +48,8 @@ enum Methods: String {
     case getFrameDuration
     case requestFormat
     case getFormat
+    case flushPlayback
+    case getPlaybackStats
 }
 
 enum Channels: String {
@@ -68,6 +87,14 @@ public class SwiftAudioIoPlugin: NSObject, FlutterPlugin {
     var _isRunning = false
     var _isPipelineSetup = false
     var _resetting = false
+    // Playback queue configuration (see _Constants / OverflowPolicy).
+    var _playbackBufferSeconds = _Constants.defaultPlaybackSeconds
+    var _playbackMaxSeconds = _Constants.defaultMaxPlaybackSeconds
+    var _overflowPolicy: OverflowPolicy = .grow
+    // Cumulative frames dropped on overflow since the last start(). Surfaced to
+    // Dart via getPlaybackStats — the explicit signal that replaces the old
+    // silent tail-drop. Mutated only on `queue`.
+    var _droppedFrames = 0
 
     private var sourceNode: AVAudioSourceNode?
     private var inputAudioConverter: AVAudioConverter?
@@ -168,11 +195,11 @@ public class SwiftAudioIoPlugin: NSObject, FlutterPlugin {
                 if instance._requestedFormat == _Constants.formatPcm16 {
                     let int16s: [Int16] = data.toArray(type: Int16.self)
                     let floats = int16s.map { Float($0) / _Constants.pcm16ScaleFactor }
-                    _ = instance.buffer.writeBlock(floats)
+                    instance.appendPlayback(floats)
                 } else {
                     let doubles: [Double] = data.toArray(type: Double.self)
                     let floats = doubles.map { Float($0) }
-                    _ = instance.buffer.writeBlock(floats)
+                    instance.appendPlayback(floats)
                 }
             }
         })
@@ -190,6 +217,9 @@ public class SwiftAudioIoPlugin: NSObject, FlutterPlugin {
             // or sample rate into a subsequent default start().
             _requestedSampleRate = _Constants.defaultSampleRate
             _requestedFormat = _Constants.formatFloat64
+            _playbackBufferSeconds = _Constants.defaultPlaybackSeconds
+            _playbackMaxSeconds = _Constants.defaultMaxPlaybackSeconds
+            _overflowPolicy = .grow
             if let args = call.arguments as? [String: Any] {
                 // Dart sends `sampleRate` (int hz) and `format` (int 0=float64, 1=pcm16),
                 // both of which arrive as NSNumber over the method channel — not Double/String.
@@ -202,6 +232,18 @@ public class SwiftAudioIoPlugin: NSObject, FlutterPlugin {
                     _requestedFormat = format.intValue == 1 ? _Constants.formatPcm16 : _Constants.formatFloat64
                 } else if let format = args["format"] as? String {
                     _requestedFormat = format
+                }
+                // Playback queue config. null on the Dart side => key absent or
+                // NSNull => keep the default.
+                if let playbackSeconds = args["playbackBufferSeconds"] as? NSNumber {
+                    _playbackBufferSeconds = playbackSeconds.doubleValue
+                }
+                if let maxPlaybackSeconds = args["maxPlaybackBufferSeconds"] as? NSNumber {
+                    _playbackMaxSeconds = maxPlaybackSeconds.doubleValue
+                }
+                if let policy = args["overflowPolicy"] as? NSNumber,
+                   let parsed = OverflowPolicy(rawValue: policy.intValue) {
+                    _overflowPolicy = parsed
                 }
             }
             start()
@@ -218,6 +260,23 @@ public class SwiftAudioIoPlugin: NSObject, FlutterPlugin {
             result(_frameDuration)
         case Methods.getFormat.rawValue:
             result(getFormat())
+        case Methods.flushPlayback.rawValue:
+            // Barge-in: drop everything still queued for playback so stale audio
+            // stops immediately. clear() only resets the read/write indices, so
+            // it is cheap and safe to run synchronously w.r.t. the render block
+            // (both serialize on `queue`).
+            queue.sync { buffer.clear() }
+            result(nil)
+        case Methods.getPlaybackStats.rawValue:
+            var stats: [String: Any] = [:]
+            queue.sync {
+                stats = [
+                    "bufferedFrames": buffer.count,
+                    "capacityFrames": buffer.capacity,
+                    "droppedFrames": _droppedFrames,
+                ]
+            }
+            result(stats)
         default:
             result(FlutterMethodNotImplemented)
         }
@@ -234,10 +293,14 @@ public class SwiftAudioIoPlugin: NSObject, FlutterPlugin {
         _sampleRate = _requestedSampleRate
         // Output is fed from the network (Gemini) in bursts, so the playback ring
         // buffer must hold seconds — not milliseconds — of audio to avoid
-        // underruns. Sized at the requested rate because the sourceNode renders
-        // at the requested rate and the mixer resamples up to the hardware rate.
-        let bufferSize = max(Int(_sampleRate * 10.0), 131072)
+        // underruns. The initial size is caller-configurable (latency vs.
+        // underrun protection); under the `grow` policy appendPlayback() lets it
+        // expand up to _playbackMaxSeconds when a burst overflows. Sized at the
+        // requested rate because the sourceNode renders at the requested rate and
+        // the mixer resamples up to the hardware rate.
+        let bufferSize = max(Int(_sampleRate * _playbackBufferSeconds), _Constants.minPlaybackSamples)
         buffer = RingBuffer<Float>(count: bufferSize)
+        _droppedFrames = 0
 
         do {
             // `.voiceChat` mode engages the system's two-way voice tuning and is the
@@ -427,6 +490,48 @@ public class SwiftAudioIoPlugin: NSObject, FlutterPlugin {
         }
     }
 
+    // Enqueues decoded playback samples, applying the configured overflow
+    // policy when the ring buffer is full. Replaces the previous
+    // `_ = buffer.writeBlock(...)`, which silently dropped the *entire*
+    // overflowing block — so a 40 s response delivered in ~5 s lost its tail
+    // with no signal. Must be called on `queue`.
+    private func appendPlayback(_ floats: [Float]) {
+        if buffer.writeBlock(floats) { return }
+
+        switch _overflowPolicy {
+        case .grow:
+            // Expand toward _playbackMaxSeconds to absorb the burst; only drop
+            // once even the ceiling can't hold it.
+            let maxSamples = max(Int(_sampleRate * _playbackMaxSeconds), buffer.capacity)
+            if buffer.capacity < maxSamples {
+                let needed = buffer.count + floats.count
+                let target = min(maxSamples, max(needed, buffer.capacity * 2))
+                buffer.resize(to: target)
+                if buffer.writeBlock(floats) { return }
+            }
+            _droppedFrames += floats.count
+        case .dropOldest:
+            // Keep the buffer current by discarding the oldest queued audio.
+            if floats.count >= buffer.capacity {
+                // The block alone exceeds the whole buffer: keep only its tail.
+                _droppedFrames += buffer.count
+                buffer.clear()
+                let tail = Array(floats.suffix(buffer.capacity))
+                _droppedFrames += floats.count - tail.count
+                _ = buffer.writeBlock(tail)
+            } else {
+                let overflow = (buffer.count + floats.count) - buffer.capacity
+                if overflow > 0 {
+                    _droppedFrames += buffer.discardOldest(overflow)
+                }
+                _ = buffer.writeBlock(floats)
+            }
+        case .dropNewest:
+            // Historical behaviour, now counted rather than silent.
+            _droppedFrames += floats.count
+        }
+    }
+
     public func getFormat() -> [String: Any] {
         let dataType = _requestedFormat == _Constants.formatPcm16
             ? AudioDataTypes.int16.rawValue
@@ -516,6 +621,43 @@ public struct RingBuffer<T> {
     public mutating func clear() {
         readIndex = 0
         writeIndex = 0
+    }
+
+    /// Total backing capacity in elements.
+    public var capacity: Int {
+        return array.count
+    }
+
+    /// Number of written-but-unread elements currently queued.
+    public var count: Int {
+        return writeIndex - readIndex
+    }
+
+    /// Discards up to `n` of the oldest unread elements; returns how many were
+    /// actually dropped. Used by the dropOldest overflow policy.
+    public mutating func discardOldest(_ n: Int) -> Int {
+        let toDrop = min(max(n, 0), count)
+        readIndex += toDrop
+        return toDrop
+    }
+
+    /// Reallocates to `newCapacity`, preserving the most recent unread elements
+    /// (and resetting the indices). Used by the grow overflow policy. Safe to
+    /// shrink, in which case only the newest `newCapacity` elements are kept.
+    public mutating func resize(to newCapacity: Int) {
+        guard newCapacity > 0 else { return }
+        let unread = count
+        let keep = min(unread, newCapacity)
+        var newArray = [T?](repeating: nil, count: newCapacity)
+        if keep > 0, array.count > 0 {
+            let start = writeIndex - keep
+            for i in 0 ..< keep {
+                newArray[i] = array[((start + i) % array.count + array.count) % array.count]
+            }
+        }
+        array = newArray
+        readIndex = 0
+        writeIndex = keep
     }
 
     fileprivate var availableSpaceForReading: Int {

@@ -178,6 +178,11 @@ class _GeminiLivePageState extends State<GeminiLivePage> {
       // 44.1/48 kHz), so 16 kHz can't be guaranteed. Opt in to the actual
       // rate; on native the device honours 16 kHz and this is ignored.
       allowSampleRateMismatch: true,
+      // Real-time conversation: start with a small playback buffer for low
+      // latency, but let it grow (default overflow policy) up to 60 s so a
+      // long Gemini response delivered as a fast burst isn't truncated.
+      playbackBufferDuration: Duration(seconds: 2),
+      maxPlaybackBufferDuration: Duration(seconds: 60),
     );
 
     await AudioIo.instance.startWith(config);
@@ -201,6 +206,15 @@ class _GeminiLivePageState extends State<GeminiLivePage> {
   void _handleServerContent(Map<String, dynamic> json) {
     final serverContent = json['serverContent'] as Map<String, dynamic>?;
     if (serverContent == null) return;
+
+    // Barge-in: the user spoke over the model, so Gemini Live tells us the
+    // turn was interrupted. Drop the audio still queued for playback so the
+    // now-stale response stops talking immediately instead of playing on top
+    // of the user. flushPlayback() leaves capture/playback running.
+    if (serverContent['interrupted'] == true) {
+      AudioIo.instance.flushPlayback();
+      return;
+    }
 
     final modelTurn = serverContent['modelTurn'] as Map<String, dynamic>?;
     if (modelTurn == null) return;
